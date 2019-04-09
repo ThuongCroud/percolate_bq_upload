@@ -10,7 +10,7 @@ import requests
 from requests.exceptions import HTTPError
 from datetime import datetime, timedelta
 from dateutil.parser import parse as dt_parse
-
+from google.cloud import bigquery
 
 
 class PercolateAPIError(BaseException):
@@ -544,7 +544,6 @@ def update_status(api_key, post_obj, status, url=None, live_at='now'):
 
     result = put_object(api_key, api_url, data=new_post_obj)
     return result
-
 
     # pprint(new_post_obj)
 

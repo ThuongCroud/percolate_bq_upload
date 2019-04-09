@@ -14,7 +14,7 @@ from ts_utils import (get_all_objects, get_object, get_id_from_uid,
 
 from django.core.validators import URLValidator
 from django.core.exceptions import ValidationError
-
+from google.cloud import bigquery
 
 class MetadataUpdater(object):
     def __init__(self, api_key, license_uid):
@@ -363,7 +363,7 @@ class MetadataUpdater(object):
         result = dict(all_new_metadata)
         return result
 
-    def get_custom_metadata(self, object_id, with_schema_name=False):
+    def get_custom_metadata(self, object_id, with_schema_name=False, with_raw_terms=False):
         params = {'object_ids': object_id}
         all_md = get_all_objects(self.api_key, '/v5/metadata/', params)
         # pprint(all_md)

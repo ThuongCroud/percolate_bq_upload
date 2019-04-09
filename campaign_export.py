@@ -8,10 +8,56 @@ from datetime import datetime, timedelta, timezone
 from dateutil.parser import parse
 from ts_utils import get_all_objects, get_object, PercolateAPIError
 from metadata_updater import MetadataUpdater
+from google.cloud import bigquery
+import pandas as pd
+import time
+import numpy as np
 
+dirname = os.path.dirname(__file__)
+
+PATH_BQ_CREDS = os.path.join(dirname, "creds/service_account.json")
+
+def handle_bigquery_update_with_retries(func):
+    """
+    Wraps Adwords data download methods, allows retries on certain error(s) with timeouts
+    """
+    TIMEOUT = 5
+    MAX_RETRIES = 20
+
+    def func_wrapper(*args, **kwargs):
+        retries = 0,
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                #special care for non-empty streaming buffer case
+                if "would affect rows in the streaming buffer, which is not supported" in str(e):
+                    raise BigQueryStreamingBufferException
+                # concurrent updates exception - retry
+                elif "due to concurrent update" in str(e):
+                    if retries < MAX_RETRIES:
+                        retries += 1
+                        timeout = retries * TIMEOUT
+                        time.sleep(timeout)
+                    else:
+                        raise BigQueryUpdateTooManyTriesException
+                else:
+                    raise e
+    return func_wrapper
+
+
+class BigQueryStreamingException(Exception):
+    pass
+
+class BigQueryStreamingBufferException(Exception):
+    pass
+
+class BigQueryUpdateTooManyTriesException(Exception):
+    pass
 
 class CSVCampaignExport(object):
-    def __init__(self, api_key):
+    BQ_CHUNK_SIZE = 1000
+    def __init__(self, api_key, bq_clear_on_update=True):
         self.api_key = api_key
         self.field_type = OrderedDict([
             ('id', 'text'), ('title', 'text'), ('description', 'text'),
@@ -46,6 +92,8 @@ class CSVCampaignExport(object):
                                 }
         self.name_cache = defaultdict(dict)
         self.separator = '|'
+        self.bq_clear_on_update = bq_clear_on_update
+        self.init_bigquery()
 
     def _format_text(self, input_str, campaign_uid):
         return input_str
@@ -76,7 +124,7 @@ class CSVCampaignExport(object):
         if input_obj is None:
             return None
         if input_obj['currency'] == 'USD':
-            return '${0:.2f}'.format(float(input_obj['amount']))
+            return '{0:.2f}'.format(float(input_obj['amount']))
         else:
             return '{} {}'.format(input_obj['amount'], input_obj['currency'])
 
@@ -173,16 +221,22 @@ class CSVCampaignExport(object):
 
             all_data_rows.append(data_row)
             all_data_dicts.append(data_dict)
-            if len(all_data_rows) % 100 == 0:
+            if len(all_data_rows) % 300 == 0:
                 print('\t{} campaigns completed'.format(len(all_data_rows)))
+                break
 
         all_data_rows.sort(key=operator.itemgetter(0))
         all_data_dicts.sort(key=lambda x: x[self.header_for['id']])
 
         campaign_data = []
-        campaign_data.append(all_data_headers)
+        #campaign_data.append(all_data_headers)
         for x in all_data_dicts:
             campaign_data.append([x.get(y) for y in all_data_headers])
+        # is the data stored as a df? can we get this easily into BQ?
+        dfobj = pd.DataFrame(campaign_data, columns = all_data_headers)
+
+        dfobj = self.finalize_df(dfobj)
+        self.stream_to_bq(dfobj, self.campaign_table)
 
         if out_dir:
 
@@ -197,6 +251,69 @@ class CSVCampaignExport(object):
         else:
             return all_data_headers, all_data_dicts
 
+    def init_bigquery(self):
+        self.bq_client = None
+        self.campaign_table = None
+        self.bq_client = bigquery.Client.from_service_account_json(PATH_BQ_CREDS)
+        self.bq_dataset_id = 'percolate_test'
+        self.campaign_table = self.bq_client.get_table(
+            self.bq_client.dataset(self.bq_dataset_id).table('campaign_data')
+        )
+
+
+    @handle_bigquery_update_with_retries
+    def delete_if_exists_bq(self,df,bq_table):
+        """
+        check if entries of the same (campaign id & timestamp) exist
+        if they do, delete
+        """
+        if len(df) == 0:
+            return
+        campaign_id, timestamp = df.iloc[0][['Campaign ID', 'timestamp']].values
+        #reusable query part
+        from_where_q = """
+            FROM `{table_name}`
+            WHERE campaign_id = {campaign_id}
+                AND timestamp = '{timestamp}'
+        """.format(
+            table_name=bq_table.full_table_id.replace(":","."),
+            campaign_id="'%s'" % campaign_id,
+            timestamp = str(timestamp),
+        )
+        # query whether such entries exist
+        query_job = self.bq_client.query("SELECT EXISTS(SELECT * %s LIMIT 1)" % from_where_q)
+        res = query_job.result()
+        exists = list(res)[0].values()[0]
+        #delete them is they exist
+        if exists:
+            query_job = self.bq_client.query("DELETE %s" % from_where_q)
+            _ = query_job.result()
+
+    def stream_to_bq(self, df, bq_table):
+        """
+        Divides DataFrame into chunks, turns them into lists of tuples, and uploads into a given big query table.
+        """
+        if self.bq_clear_on_update:
+            self.delete_if_exists_bq(df, bq_table)
+
+        def iter_chunks(df):
+            for i in range(0, len(df), self.BQ_CHUNK_SIZE):
+                yield [tuple(np.nan_to_num(x, copy=False)) for x in df[i: i+self.BQ_CHUNK_SIZE].values]
+
+        for chunk in iter_chunks(df):
+            errors = self.bq_client.insert_rows(bq_table, chunk)
+            if errors:
+                raise BigQueryStreamingException(errors)
+    def finalize_df(self, df_orig, column_map=None, final_columns=None):
+        """
+        Finalizes Dataframe for streaming to BQ, performs some routine operations
+        """
+        df = df_orig.copy()
+        df['timestamp']= datetime.today().strftime('%Y-%m-%d')
+        for column in ['Budget']:
+            if column in df.columns:
+                df[column] = df[column].map(lambda x: float(x.rstrip('00 GBP')) if type(x) is str else x)
+        return df
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
