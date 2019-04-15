@@ -221,9 +221,8 @@ class CSVCampaignExport(object):
 
             all_data_rows.append(data_row)
             all_data_dicts.append(data_dict)
-            if len(all_data_rows) % 300 == 0:
+            if len(all_data_rows) % 100 == 0:
                 print('\t{} campaigns completed'.format(len(all_data_rows)))
-                break
 
         all_data_rows.sort(key=operator.itemgetter(0))
         all_data_dicts.sort(key=lambda x: x[self.header_for['id']])
@@ -257,7 +256,7 @@ class CSVCampaignExport(object):
         self.bq_client = bigquery.Client.from_service_account_json(PATH_BQ_CREDS)
         self.bq_dataset_id = 'percolate_test'
         self.campaign_table = self.bq_client.get_table(
-            self.bq_client.dataset(self.bq_dataset_id).table('campaign_data')
+            self.bq_client.dataset(self.bq_dataset_id).table('test_data')
         )
 
 
@@ -312,8 +311,40 @@ class CSVCampaignExport(object):
         df['timestamp']= datetime.today().strftime('%Y-%m-%d')
         for column in ['Budget']:
             if column in df.columns:
-                df[column] = df[column].map(lambda x: float(x.rstrip('00 GBP')) if type(x) is str else x)
+                #df[column] = df[column].map(lambda x: float(x.rstrip('00 GBP')) if type(x) is str else x)
+                df[column] = df[column].map(lambda x: float(x[:x.index('.')+2]) if type(x) is str else x)
+
+        df['Description'] = df['Description'].apply(lambda row: self.turn_into_null(row))
+        df['Platforms'] = df['Platforms'].apply(lambda row: self.turn_into_null(row))
+        df['Budget'] = df['Budget'].apply(lambda row: self.turn_into_null(row))
+        df['Terms'] = df['Terms'].apply(lambda row: self.turn_into_null(row))
+        df['Topics'] = df['Topics'].apply(lambda row: self.turn_into_null(row))
+        df['Thumbnail Asset'] = df['Thumbnail Asset'].apply(lambda row: self.turn_into_null(row))
+        df['Custom Metadata: Segment'] = df['Custom Metadata: Segment'].apply(lambda row: self.turn_into_null(row))
+        df['Custom Metadata: Product'] = df['Custom Metadata: Product'].apply(lambda row: self.turn_into_null(row))
+        df['Start At'] = df['Start At'].apply(lambda row: self.turn_into_null(row))
+        df['End At'] = df['End At'].apply(lambda row: self.turn_into_null(row))
+        df['Created At'] = df['Created At'].apply(lambda row: self.turn_into_null(row))
+        df['Updated At'] = df['Updated At'].apply(lambda row: self.turn_into_null(row))
+        df['Custom Metadata: Channel'] = df['Custom Metadata: Channel'].apply(lambda row: self.turn_into_null(row))
+        df['Updated At'] = df['Updated At'].apply(lambda row: row[0:19])
+        df['Created At'] = df['Created At'].apply(lambda row: row[0:19])
+
         return df
+
+    def turn_into_null(self,value):
+      if value == '':
+        return None
+      elif type(value) == type(pd.NaT):
+        return None
+      elif type(value) == type(np.nan):
+        return None
+      elif value == 'None':
+        return None
+      elif value == 'N/A':
+        return None
+      else:
+        return value
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -332,6 +363,6 @@ if __name__ == '__main__':
     ce = CSVCampaignExport(args.api_key)
     for license_uid in args.license_uid:
         print(license_uid)
-        all_data = ce.get_export(license_uid, args.out_directory, params_dict,
+        all_data = ce.get_export(license_uid, out_dir=None, params_dict=params_dict,
                                  extend_scopes=extend_scopes
                                  )
